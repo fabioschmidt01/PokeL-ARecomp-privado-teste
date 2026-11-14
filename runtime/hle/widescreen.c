@@ -22,7 +22,97 @@ float widescreen_factor(void) { return g_wide; }
 // matrix sees the wider view too. The aspect field itself keeps the game's 16:9. LARECOMP_NO_WIDESCREEN=1 (or F1 > Aspect ratio > Original 16:9): g_wide stays 1, the game's own
 // projection. Before (v0.26.5) the vertex uniforms were rescaled after the fact (exec.c), which missed the camera.
 #include "widescreen_proj.h"
+// F1 > Video > Field of view, here too: a 16:9 perspective camera's tan(fovy / 2) times tan(fov / 2) / tan(30 deg) (60:
+// the game's own view). Every matrix the game builds sees it - the scene, its particles and fire, Pokémon's eyes and
+// alert marks, culling. Scaled afterwards in the scene camera's uniforms instead (exec.c, v0.26.6 and before), only the
+// draws reading that buffer widened: at fov 90 (x0.577) torch fire, Ponyta's mane and the alert marks stayed where
+// the 60-degree view had them (user screenshots, 2026-11-14). LARECOMP_FOV_UBO=1: the old way.
+static float pla_fov_tan_scale(void) {
+    static int ubo = -1;
+    if (ubo < 0) ubo = ENV("LARECOMP_FOV_UBO") && atoi(ENV("LARECOMP_FOV_UBO")) != 0;
+    int fov = g_settings.fov;
+    if (ubo || fov < FOV_MIN || fov > FOV_MAX || fov == FOV_DEFAULT) return 1.0f;
+    return tanf((float)fov * 0.5f * (float)M_PI / 180.0f) / tanf(30.0f * (float)M_PI / 180.0f);
+}
+
+// Cameras that keep their own fovy: 2D content laid out in front of a perspective camera, sized for its view - the
+// title screen's scene picture (a 30-degree camera; the field's is 50), which shrank to a 0.58 box at fov 90
+// (2026-11-14). LARECOMP_FOV_KEEP=<deg>,<deg>...: the fovy values (+-0.05 degrees) left alone instead of 30 (empty:
+// none). Every new camera's fovy and aspect is logged ("[fov] camera seen", 48 at most) to find them.
+static bool fov_keep(float deg) {
+    static float keep[16];
+    static int nkeep = -1;
+    if (nkeep < 0) {
+        nkeep = 0;
+        const char *e = ENV("LARECOMP_FOV_KEEP");
+        if (!e) keep[nkeep++] = 30.0f;  // (the title screen's camera)
+        for (const char *p = e; p && *p && nkeep < 16;) {
+            keep[nkeep++] = (float)atof(p);
+            p = strchr(p, ',');
+            if (p) p++;
+        }
+    }
+    for (int i = 0; i < nkeep; i++) if (fabsf(deg - keep[i]) < 0.05f) return true;
+    return false;
+}
+
+static void fov_seen(float aspect, float deg) {
+    static struct { float a, d; } seen[48];
+    static int nseen;
+    for (int i = 0; i < nseen; i++) if (fabsf(seen[i].a - aspect) < 1e-3f && fabsf(seen[i].d - deg) < 0.05f) return;
+    if (nseen >= 48) return;
+    seen[nseen].a = aspect, seen[nseen].d = deg, nseen++;
+    extern uint64_t renderer_present_count(void);
+    LOG("[fov] camera seen: fovy %.2f degrees, aspect %.4f (frame %llu)\n", deg, aspect,
+        (unsigned long long)renderer_present_count());
+}
+
+// (exec.c draw_) a camera-attached effect drawn for the game's 60-degree view: its viewport is widened by this much in
+// x and y (centred) so it covers the screen at a wider field of view. The damage vignette (the brush-stroke frame when
+// the player is hurt: a 96-vertex mesh in front of the camera, the one draw of its pass without depth testing - F9 dump
+// of 2026-11-14, pass 79; the 3996-index draws next to it are the flowers): at fov 90 it shrank to a box in the middle
+// of the screen. LARECOMP_FOV_STRETCH_FS=<hex hash>,...: other fragment shader hashes as well (F9's frame dump lists
+// every draw's); each one is logged the first time it is stretched.
+float fov_effect_stretch(uint64_t fs_hash) {
+    static uint64_t k[16];
+    static int nk = -1;
+    if (nk < 0) {
+        nk = 0;
+        k[nk++] = 0x850d6a5d7a51e34bull;  // damage vignette
+        for (const char *p = ENV("LARECOMP_FOV_STRETCH_FS"); p && *p && nk < 16;) {
+            k[nk++] = strtoull(p, NULL, 16);
+            p = strchr(p, ',');
+            if (p) p++;
+        }
+    }
+    float t = pla_fov_tan_scale();
+    if (t == 1.0f || g_game_is_la) return 1.0f;
+    static uint16_t logged;
+    for (int i = 0; i < nk; i++)
+        if (k[i] == fs_hash) {
+            if (!(logged & (1u << i))) {
+                logged |= (uint16_t)(1u << i);
+                LOG("[fov] camera-attached effect stretched x%.3f (fs hash %016llx)\n", t, (unsigned long long)fs_hash);
+            }
+            return t;
+        }
+    return 1.0f;
+}
+
 float rt_pla_proj_aspect(float aspect, float *half_fovy) {
+    float t = pla_fov_tan_scale(), deg = *half_fovy * 360.0f / (float)M_PI;
+    fov_seen(aspect, deg);
+    if (t != 1.0f && fabsf(aspect - WIDESCREEN_PROJ_ASPECT_16_9) < 0.01f && *half_fovy > 0.0f && *half_fovy < 1.5707f &&
+        !fov_keep(deg)) {
+        float h = atanf(tanf(*half_fovy) * t);
+        static int logged_fov;
+        if (logged_fov != g_settings.fov) {
+            logged_fov = g_settings.fov;
+            LOG("[fov] camera fovy %.1f -> %.1f degrees (F1 > Video > Field of view %d)\n", *half_fovy * 360.0f / (float)M_PI,
+                h * 360.0f / (float)M_PI, g_settings.fov);
+        }
+        *half_fovy = h;
+    }
     float wide = g_wide, a = widescreen_proj_aspect(aspect, wide, half_fovy);
     static float logged = 1.0f;  // (once per shape: the camera that took it)
     if (a != aspect && wide != logged) {
