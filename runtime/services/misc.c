@@ -67,6 +67,47 @@ SERVICE("friend:u", friend_u) { friend_root(s, req, resp); }
 SERVICE("friend:a", friend_a) { friend_root(s, req, resp); }
 SERVICE("friend:v", friend_v) { friend_root(s, req, resp); }
 
+// ------------------------------------------------------------------ nifm:u / nifm:s / nifm:a
+// The network interface service: a Switch with no internet connection. Pokémon Legends Arceus asks for it from a
+// menu after 15 minutes of play (2026-11-14: nifm:u cmd 5); the logging stub returned no IGeneralService and the SDK
+// read through the missing object (a crash, f_700832fd50). A connection request is never accepted: its state is
+// "error / not submitted" and its result "pending connection" (NIFM 111), as on a console in airplane mode - the game
+// then tells the player it is offline.
+#define NIFM_PENDING_CONNECTION MAKE_RESULT(110, 111)
+static void nifm_request(Service *s, IpcReq *req, IpcResp *resp) {
+    (void)s;
+    switch (req->cmd) {
+    case 0: OUT(uint32_t, 0) = 1; resp_size(resp, 4); break;  // GetRequestState: 1 (not submitted / error)
+    case 1: resp->result = NIFM_PENDING_CONNECTION; break;      // GetResult
+    case 2:                                                      // GetSystemEventReadableHandles (never signalled)
+        resp->copy_handles[resp->ncopy++] = new_event_handle();
+        resp->copy_handles[resp->ncopy++] = new_event_handle();
+        break;
+    default: LOG("[nifm] IRequest cmd %u (ok)\n", req->cmd); resp_size(resp, 0x10);  // Cancel, Submit, Set*...
+    }
+}
+static void nifm_general(Service *s, IpcReq *req, IpcResp *resp) {
+    (void)s;
+    switch (req->cmd) {
+    case 1: OUT(uint64_t, 0) = 1; resp_size(resp, 8); break;  // GetClientId
+    case 4: ipc_return_object(resp, service_new("IRequest", nifm_request, NULL)); break;  // CreateRequest
+    case 12: resp->result = NIFM_PENDING_CONNECTION; break;    // GetCurrentIpAddress: none
+    case 18: resp->result = NIFM_PENDING_CONNECTION; break;    // GetInternetConnectionStatus: not connected
+    case 21: case 22: case 32: case 33:  // Is{Wireless,Ethernet}CommunicationEnabled, IsAny{Internet,Foreground}RequestAccepted
+        OUT(uint8_t, 0) = 0; resp_size(resp, 1); break;
+    default: LOG("[nifm] IGeneralService cmd %u (ok)\n", req->cmd); resp_size(resp, 0x10);
+    }
+}
+static void nifm_root(Service *s, IpcReq *req, IpcResp *resp) {
+    (void)s;
+    if (req->cmd == 4 || req->cmd == 5)  // CreateGeneralServiceOld / CreateGeneralService
+        ipc_return_object(resp, service_new("IGeneralService", nifm_general, NULL));
+    else LOG("[nifm] cmd %u (ok)\n", req->cmd);
+}
+SERVICE("nifm:u", nifm_u) { nifm_root(s, req, resp); }
+SERVICE("nifm:s", nifm_s) { nifm_root(s, req, resp); }
+SERVICE("nifm:a", nifm_a) { nifm_root(s, req, resp); }
+
 // ------------------------------------------------------------------ prepo:u / prepo:a / prepo:m / prepo:s
 // Play report telemetry services (nn::prepo). Pokémon Legends Arceus periodically submits play reports
 // in Jubilife Village and Hisui areas. Stubbed safely so reports succeed without attempting Nintendo telemetry,
