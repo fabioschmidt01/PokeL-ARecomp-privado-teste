@@ -2,6 +2,7 @@
 // Render targets the game sizes for the Switch's 1920x1080 screen are allocated at (sx, sy) times their size; the
 // image is then drawn into (vx, vy, vw, vh) of the window. Video tab "Internal resolution" (g_settings.res_mode):
 //   Match display  render at the window's own pixel size (default)
+//   720p           720 lines whatever the display (the Switch's handheld image): the Light profile's choice
 //   1x .. 4x       N times the Switch's docked image: 1080 lines x N (wide windows keep their shape: 32:9 at 2x =
 //                  7680 x 2160); capped to the GPU's 16384-pixel texture limit. 1x on an integrated GPU: 720 lines,
 //                  what the game's own scaler picked there (UHD 770); its scaler is off now (see rt_game_dynres)
@@ -463,6 +464,7 @@ void output_scale(double dw, double dh, bool reshape_allowed, double now, double
     if (forced > 0) h = forced;
     else if (mode >= 1 && mode <= 8) h = mode == 1 && g_gpu_integrated ? 720 / 1080.0 : mode;
     else if (mode == RES_X15) h = 1.5;  // (between 1x and 2x: most of 2x's smoothing for about half its cost)
+    else if (mode == RES_720) h = 720 / 1080.0;  // (the Switch's handheld image: Steam Deck, integrated / older GPUs)
     else {
         h = reshape ? dh / 1080.0 : fit;  // Match display
         if (hh) h *= 1080.0 / 720.0;

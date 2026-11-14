@@ -149,7 +149,7 @@ bool g_gpu_integrated;
 static const char *res_name(int m) {
     static char n[8];
     if (m >= 1 && m <= 8) { snprintf(n, sizeof n, "%dx", m); return n; }
-    return m == RES_X15 ? "1.5x" : m == RES_DYNAMIC ? "dynamic" : m == RES_Q75 ? "75%" : m == RES_Q50 ? "50%" : m == RES_Q25 ? "25%" : "match";
+    return m == RES_X15 ? "1.5x" : m == RES_720 ? "720p" : m == RES_DYNAMIC ? "dynamic" : m == RES_Q75 ? "75%" : m == RES_Q50 ? "50%" : m == RES_Q25 ? "25%" : "match";
 }
 
 const char *settings_res_name(int m) { return res_name(m); }  // ("1.5x", "75%", "match"...: the ini's words)
@@ -232,7 +232,9 @@ void settings_video_recommend(unsigned vendor, bool integrated, uint64_t vram, c
             if (!strcasecmp(e, video_profile_name(i, false))) p = i;
     VideoRec *r = &g_video_rec;
     r->profile = p;
-    r->res_mode = p == VPROF_LIGHT ? RES_Q75 : p == VPROF_ULTRA ? RES_X15 : 1;
+    // (Light: 720p, the Switch's handheld image - a fixed size, where 75% of the display was 810 lines on a 1080p screen
+    // and 1080 on a 1440p one)
+    r->res_mode = p == VPROF_LIGHT ? RES_720 : p == VPROF_ULTRA ? RES_X15 : 1;
     // 30 fps whatever the PC: at 60, Pokémon Legends: Arceus's frame-counting systems run twice as fast (thrown food
     // vanishes before wild Pokémon eat it, #9; fast menus and dialogue) - 60 stays the player's own, experimental choice
     r->fps60 = false;
@@ -334,7 +336,7 @@ void settings_load(void) {
             int n = atoi(val);
             g_settings.res_auto = !strcmp(val, "auto");
             if (g_settings.res_auto) { g_settings.res_mode = g_default_res_mode; continue; }
-            g_settings.res_mode = !strcmp(val, "1.5x") ? RES_X15 :
+            g_settings.res_mode = !strcmp(val, "1.5x") ? RES_X15 : !strcmp(val, "720p") ? RES_720 :
                                   !strcmp(val, "dynamic") ? RES_DYNAMIC : (!strcmp(val, "75%") || !strcmp(val, "67%")) ? RES_Q75 :
                                   !strcmp(val, "50%") ? RES_Q50 : !strcmp(val, "25%") ? RES_Q25 :
                                   (n >= 1 && n <= 4) ? n : n > 4 ? 4 : RES_MATCH;  // (5x-8x were removed)
