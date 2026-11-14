@@ -359,6 +359,7 @@ static void prescan(uint64_t handle, Fences *f, int depth) {
     uint64_t p = handle;
     for (int guard = 0; guard < 10000000; guard++) {
         const CmdRec *r = (const CmdRec *)(uintptr_t)p;
+        if (p < 0x10000 || r->size < sizeof(CmdRec) || (r->size & 7) || r->op >= CMD_COUNT) return;  // (corrupt: exec_list drops it too)
         switch (r->op) {
         case CMD_END: return;
         case CMD_JUMP: p = r->x[0]; continue;
@@ -474,6 +475,16 @@ uint64_t rq_fence_seq(void) {
 }
 
 uint64_t rq_frame(void) { return exec_frame; }
+
+// (cmdbuf.c: a command memory shadow is freed once the items reaching into it are translated) the items translated
+// so far; everything, with the render thread off (lists are translated as they are submitted)
+uint64_t rq_done_seq(void) {
+    if (atomic_load(&on) <= 0 || !atomic_load(&started)) return UINT64_MAX;
+    lock_timed();
+    uint64_t d = q_done;
+    pthread_mutex_unlock(&lock);
+    return d;
+}
 
 uint64_t rq_current_item(void) {
     if (!atomic_load(&started) || !pthread_equal(pthread_self(), thread)) return 0;

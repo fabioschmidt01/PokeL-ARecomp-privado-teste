@@ -302,7 +302,13 @@ int nvn_pool_flags_at(uint64_t addr) {
         if (addr >= pools[i].storage && addr < pools[i].storage + pools[i].size) return (int)pools[i].flags;
     return -1;
 }
-NVN(nvnMemoryPoolFinalize) { free(HOST(NvnPool, A(0))); SET_HOST(A(0), 0); }
+NVN(nvnMemoryPoolFinalize) {
+    NvnPool *p = HOST(NvnPool, A(0));
+    extern void nvn_cmdmem_pool_gone(uint64_t storage, uint64_t size);  // (cmdbuf.c: command list shadows in it)
+    if (p) nvn_cmdmem_pool_gone(p->storage, p->size);
+    free(p);
+    SET_HOST(A(0), 0);
+}
 NVN(nvnMemoryPoolSetDebugLabel) { (void)c; static int seen_; if (!seen_++ && ENV("LARECOMP_LOG_NOOP")) LOG("[nvn] no-op called: nvnMemoryPoolSetDebugLabel\n"); }
 NVN(nvnMemoryPoolMap) { RET(HOST(NvnPool, A(0))->storage); }
 NVN(nvnMemoryPoolGetBufferAddress) { RET(HOST(NvnPool, A(0))->storage); }  // GPU address == CPU address
@@ -986,7 +992,10 @@ static void present_pace(int interval) {
     extern bool rt_pla_is_60fps(void);
     // (not frame generation: it presents its own in-between frame - with the game paced at 60 on a 30 fps clock the
     // world ran twice as fast)
-    if ((g_settings.fps60 || rt_pla_is_60fps()) && interval > 1) interval = 1;
+    // (Pokémon Legends: Arceus: the pace follows the frame clock's mode alone - rt_pla_is_60fps, which LARECOMP_FPS
+    // overrides; with the setting's fps60 here too, LARECOMP_FPS=30 over a 60 fps ini paced 60 on a 30 fps clock: 2x)
+    extern int g_game_is_la;
+    if ((g_game_is_la ? g_settings.fps60 || rt_pla_is_60fps() : rt_pla_is_60fps()) && interval > 1) interval = 1;
     static int logged = -12345;
     if (interval != logged) { logged = interval; LOG("[nvn] present interval %d\n", interval); }
     extern int g_out_present_interval;  // (output_scale.c: dynamic resolution's frame budget)

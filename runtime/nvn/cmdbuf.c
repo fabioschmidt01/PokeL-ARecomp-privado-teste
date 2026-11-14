@@ -28,70 +28,210 @@ static CmdRec *raw_rec(uint64_t at, uint32_t op, uint32_t size) {
     return r;
 }
 
-// Host overflow chunks. Our records are far bigger than the hardware's commands (and some carry copied data), so a
-// record can outgrow what the game's memory callback hands out: the list then goes on in host memory. A chunk is
-// reached only through a jump from the guest chunk it continues (its owner), and lives until the game gives that
-// guest memory to a command buffer again (the old list is gone then).
-typedef struct Overflow { uint64_t owner; void *mem; struct Overflow *next; } Overflow;
-static Overflow *overflows;
-static pthread_mutex_t overflow_lock = PTHREAD_MUTEX_INITIALIZER;
+// Records live in host memory, never in the game's command memory. Each chunk the game hands over
+// (nvnCommandBufferAddCommandMemory) gets a host "shadow" of the same size, and the game's accounting stays exactly as
+// before (sizes, Used / Free, the memory callback). Recorded into the guest chunk itself, a list could be rewritten
+// before the render thread translated it: in Floaro Main Street (PLA, 2026-11-14) the game handed a command buffer
+// memory that lists still queued were in - a jump record pointed back into its own page, the called lists turned into
+// allocator garbage (a "corrupt command list", then a crash in exec_list / guest_copy; the device lost on slower
+// CPUs, #7 / #12). Our records are several times the size of the hardware's commands, so the game's command memory
+// turns over that much faster than it was built for.
+// A shadow is freed once the game gave that guest memory out again (retired), everything queued for the render thread
+// by then was translated, and 8 frames went by (lists submitted right after it are translated too: the render thread
+// stays within a frame or two of the game) - so whatever the game does with its memory, a list's records stay as
+// recorded until they are translated. Chunks the game never gives out again (lists it keeps and calls) stay.
+// PLA hands out ~1 KB chunks, ~10000 a second: the guest pages index the live shadows (retiring looks at that page's
+// few), the retired ones wait in a queue in retirement order (freeing looks at its head) - a first version walked
+// every live shadow per chunk, 20000 of them in Jubilife: 7 fps. Records also no longer dirty the guest heap's pages
+// (the write watch). LARECOMP_CMD_SHADOW=0: off (records in guest memory, as before).
+typedef struct ShNode { uint64_t page; struct Shadow *s; struct ShNode *next; } ShNode;
+typedef struct Shadow {
+    uint64_t gbase;
+    volatile uint64_t gend;  // the guest chunk it shadows, as far as records were accounted in it (rec; an overflow
+                             // chunk: the guest chunk it continues)
+    uint8_t *mem;
+    uint64_t size;
+    uint64_t retired_frame, retired_q;  // when the game gave the guest memory out again: frame, render-queue items queued
+    bool retired;
+    ShNode *nodes;  // one per guest page (in the page index while live)
+    int nnodes;
+    struct Shadow *next;  // (the retired queue)
+} Shadow;
+#define SH_BUCKETS 65536
+static ShNode *sh_index[SH_BUCKETS];
+static Shadow *retired_head, *retired_tail;
+static uint64_t shadow_live, shadow_bytes, shadow_freed, shadow_retired_n;
+static pthread_mutex_t shadow_lock = PTHREAD_MUTEX_INITIALIZER;
+static int shadow_on = -1;
+extern uint64_t renderer_present_count(void);
+extern uint64_t rq_done_seq(void);   // (rqueue.c: items translated so far; UINT64_MAX with the render thread off)
+extern uint64_t rq_fence_seq(void);  // (rqueue.c: items queued so far)
 
-static void overflow_free(uint64_t owner) {
-    pthread_mutex_lock(&overflow_lock);
-    for (Overflow **p = &overflows; *p;) {
-        if ((*p)->owner == owner) {
-            Overflow *o = *p;
-            *p = o->next;
-            free(o->mem);
-            free(o);
-        } else {
-            p = &(*p)->next;
-        }
+static bool shadows_enabled(void) {
+    if (shadow_on < 0) {
+        const char *e = getenv("LARECOMP_CMD_SHADOW");
+        shadow_on = !e || atoi(e) != 0;
+        LOG("[nvn] command lists recorded in %s (LARECOMP_CMD_SHADOW=%d: %s)\n",
+            shadow_on ? "host memory (the game's command memory only accounted)" : "the game's command memory",
+            !shadow_on, shadow_on ? "in the game's memory" : "in host memory");
     }
-    pthread_mutex_unlock(&overflow_lock);
+    return shadow_on;
 }
+
+static inline unsigned sh_hash(uint64_t page) { return (unsigned)((page * 0x9E3779B97F4A7C15ull) >> 48) & (SH_BUCKETS - 1); }
+
+// [gbase, gend): its guest range now (grows as records are accounted); [gbase, iend): the pages it is indexed under
+static Shadow *shadow_new(uint64_t gbase, uint64_t gend, uint64_t iend, uint64_t size) {
+    Shadow *s = calloc(1, sizeof *s);
+    s->gbase = gbase, s->gend = gend, s->size = size;
+    s->mem = malloc(size);
+    if (iend > gbase) {
+        uint64_t p0 = gbase >> 12, p1 = (iend - 1) >> 12;
+        s->nnodes = (int)(p1 - p0 + 1);
+        s->nodes = malloc(sizeof *s->nodes * (size_t)s->nnodes);
+        for (int i = 0; i < s->nnodes; i++) s->nodes[i] = (ShNode){.page = p0 + (uint64_t)i, .s = s};
+    }
+    pthread_mutex_lock(&shadow_lock);
+    for (int i = 0; i < s->nnodes; i++) {
+        ShNode **b = &sh_index[sh_hash(s->nodes[i].page)];
+        s->nodes[i].next = *b;
+        *b = &s->nodes[i];
+    }
+    shadow_live++;
+    shadow_bytes += size;
+    pthread_mutex_unlock(&shadow_lock);
+    return s;
+}
+
+static void sh_unlink(Shadow *s) {  // (shadow_lock) out of the page index
+    for (int i = 0; i < s->nnodes; i++)
+        for (ShNode **p = &sh_index[sh_hash(s->nodes[i].page)]; *p; p = &(*p)->next)
+            if (*p == &s->nodes[i]) { *p = s->nodes[i].next; break; }
+}
+
+// The game gives [gbase, gend) out again: the shadows of chunks there are retired, and retired ones whose time is up
+// are freed.
+static void shadows_retire(uint64_t gbase, uint64_t gend) {
+    uint64_t now = renderer_present_count(), done = rq_done_seq(), queued = rq_fence_seq();
+    pthread_mutex_lock(&shadow_lock);
+    if (gend > gbase)
+        for (uint64_t pg = gbase >> 12; pg <= (gend - 1) >> 12; pg++) {
+            for (ShNode *n = sh_index[sh_hash(pg)]; n;) {
+                Shadow *s = n->s;
+                n = n->next;
+                if (s->gbase >= gend || gbase >= s->gend) continue;  // (a bucket holds other pages' nodes too)
+                s->retired = true, s->retired_frame = now, s->retired_q = queued;
+                sh_unlink(s);
+                n = sh_index[sh_hash(pg)];  // (unlinking may have taken the next node: the bucket again - it is short)
+                if (retired_tail) retired_tail->next = s; else retired_head = s;
+                retired_tail = s;
+                shadow_retired_n++;
+            }
+        }
+    while (retired_head && now >= retired_head->retired_frame + 8 && done >= retired_head->retired_q) {
+        Shadow *s = retired_head;
+        retired_head = s->next;
+        if (!retired_head) retired_tail = NULL;
+        shadow_live--, shadow_retired_n--, shadow_freed++;
+        shadow_bytes -= s->size;
+        free(s->nodes);
+        free(s->mem);
+        free(s);
+    }
+    static uint64_t calls;
+    if (++calls % 50000 == 0)
+        LOG("[nvn] command memory shadows: %llu live (%llu retired, waiting), %.1f MB, %llu freed\n",
+            (unsigned long long)shadow_live, (unsigned long long)shadow_retired_n, shadow_bytes / 1048576.0,
+            (unsigned long long)shadow_freed);
+    pthread_mutex_unlock(&shadow_lock);
+}
+
+// The game is told hardware-like sizes: a record counts 16 bytes plus its copied data (ours: 80 plus the data, ~5x a
+// hardware command). Told our own sizes, the game's command memory allocator went ~5x faster than it was built for
+// and gave out memory still holding lists it calls later (PLA: ~12000 chunks of ~1 KB a second) - with the records
+// there, they were rewritten (Floaro's crash); with them in shadows, those shadows were retired and freed while the
+// game still called them: a list calling itself in the reused memory, 7 million draws a frame, a black screen after
+// 22 minutes (2026-11-14). Only the part accounted counts as a shadow's guest range (Shadow.gend: an allocator that
+// takes back a chunk's unused tail must not retire it).
+// A shadow starts at 2x its guest chunk (records are up to 5x the accounting, ~2x on average); when it is full and the
+// game's chunk is not, the list goes on in another shadow for the rest of that chunk (host_continue: no call to the
+// game) - each shadow covers the guest bytes accounted while it was current. 5x up front was ~375 MB after 20 minutes.
+#define ACCT(extra) ((16u + (extra) + 7u) & ~7u)
+#define JUMP_ACCT 16u
+#define SHADOW_SCALE 5u   // (records per accounted byte at most: the overflow chunk's view)
+#define SHADOW_START 2u   // (a new shadow: this many times its guest chunk)
+
+// The shadow is full, the game's chunk is not: the rest of the chunk goes on in a new shadow.
+static void host_continue(NvnCmdBuf *cb, uint32_t need) {
+    uint64_t at = cb->gmem + cb->gused, left = cb->gsize > cb->gused ? cb->gsize - cb->gused : 0;
+    uint64_t size = left * SHADOW_START + 2 * JUMP_RESERVE;
+    if (size < need + 2 * JUMP_RESERVE) size = need + 2 * JUMP_RESERVE;
+    Shadow *s = shadow_new(at, at, cb->gmem + cb->gsize, size);
+    CmdRec *j = raw_rec(cb->mem + cb->used, CMD_JUMP, sizeof(CmdRec));
+    j->x[0] = (uint64_t)(uintptr_t)s->mem;
+    cb->mem = (uint64_t)(uintptr_t)s->mem;
+    cb->size = size;
+    cb->used = 0;
+    cb->shadow = s;
+    static uint64_t n;
+    if (++n == 1 || n == 100000) LOG("[nvn] command memory: a shadow continued in another (%llu times)\n", (unsigned long long)n);
+}
+
+// (objects.c nvnMemoryPoolFinalize) the game is done with a whole pool: shadows of chunks in it are retired too (its
+// memory may go back to the heap and never come out as command memory again)
+void nvn_cmdmem_pool_gone(uint64_t storage, uint64_t size) { if (size) shadows_retire(storage, storage + size); }
 
 static void overflow_chunk(NvnCmdBuf *cb, uint32_t need) {
     uint64_t size = need + JUMP_RESERVE > 0x10000 ? need + JUMP_RESERVE : 0x10000;
-    Overflow *o = malloc(sizeof *o);
-    o->owner = cb->owner ? cb->owner : cb->mem;
-    o->mem = malloc(size);
-    pthread_mutex_lock(&overflow_lock);
-    o->next = overflows;
-    overflows = o;
-    pthread_mutex_unlock(&overflow_lock);
+    bool sh = shadows_enabled();
+    // (retired with the guest chunk it continues; without shadows that is all there is of it)
+    uint64_t gend = sh ? cb->gmem + cb->gused : cb->gmem + cb->gsize;
+    Shadow *s = shadow_new(cb->gmem, gend, gend, size);
     static int logged;
     if (logged++ < 5) LOG("[nvn] command memory overflow: %u bytes, list goes on in host memory\n", need);
     if (cb->mem) {
         CmdRec *j = raw_rec(cb->mem + cb->used, CMD_JUMP, sizeof(CmdRec));
-        j->x[0] = (uint64_t)(uintptr_t)o->mem;
+        j->x[0] = (uint64_t)(uintptr_t)s->mem;
     }
-    cb->owner = o->owner;
-    cb->mem = (uint64_t)(uintptr_t)o->mem;
+    cb->mem = (uint64_t)(uintptr_t)s->mem;
     cb->size = size;
     cb->used = 0;
+    cb->shadow = NULL;  // (its guest range stays as it is now)
+    if (sh) cb->gsize = cb->gused + size / SHADOW_SCALE;  // (the game's view: room again, as much as the host chunk holds)
+    else cb->gmem = cb->mem, cb->gsize = size, cb->gused = 0;
 }
 
 NVN(nvnCommandBufferAddCommandMemory) {
     NvnCmdBuf *cb = cb_of(A(0));
-    uint64_t mem = HOST(NvnPool, A(1))->storage + A(2), size = A(3);
-    overflow_free(mem);  // (records there from an earlier list are dead)
-    cb->owner = 0;
+    uint64_t gmem = HOST(NvnPool, A(1))->storage + A(2), size = A(3);
+    shadows_retire(gmem, gmem + size);  // (records from earlier lists there: freed once nothing reads them)
+    uint64_t mem = gmem, hsize = size;
+    Shadow *s = NULL;
+    if (shadows_enabled()) {
+        hsize = size * SHADOW_START + 2 * JUMP_RESERVE;
+        s = shadow_new(gmem, gmem, gmem + size, hsize);  // (its guest range grows as records are accounted)
+        mem = (uint64_t)(uintptr_t)s->mem;
+    }
     if (cb->recording && cb->mem) {
         // chain the list being recorded into the new chunk
         CmdRec *j = raw_rec(cb->mem + cb->used, CMD_JUMP, sizeof(CmdRec));
         j->x[0] = mem;
     }
+    cb->gmem = gmem;
+    cb->gsize = size;
+    cb->gused = 0;
+    cb->shadow = s;
     cb->mem = mem;
-    cb->size = size;
+    cb->size = hsize;
     cb->used = 0;
 }
 NVN(nvnCommandBufferAddControlMemory) { (void)c; static int seen_; if (!seen_++ && ENV("LARECOMP_LOG_NOOP")) LOG("[nvn] no-op called: nvnCommandBufferAddControlMemory\n"); }
-NVN(nvnCommandBufferGetCommandMemorySize) { RET(cb_of(A(0))->size); }
-NVN(nvnCommandBufferGetCommandMemoryUsed) { RET(cb_of(A(0))->used); }
+NVN(nvnCommandBufferGetCommandMemorySize) { RET(cb_of(A(0))->gsize); }
+NVN(nvnCommandBufferGetCommandMemoryUsed) { RET(cb_of(A(0))->gused); }
 NVN(nvnCommandBufferGetCommandMemoryFree) {
     NvnCmdBuf *cb = cb_of(A(0));
-    RET(cb->size > cb->used + JUMP_RESERVE ? cb->size - cb->used - JUMP_RESERVE : 0);
+    uint64_t jr = shadow_on > 0 ? JUMP_ACCT : JUMP_RESERVE;
+    RET(cb->gsize > cb->gused + jr ? cb->gsize - cb->gused - jr : 0);
 }
 NVN(nvnCommandBufferGetControlMemorySize) { RET(0x10000); }
 NVN(nvnCommandBufferGetControlMemoryUsed) { RET(0); }
@@ -106,7 +246,12 @@ NVN(nvnCommandBufferSetCommandMemoryCallbackEnabled) { (void)c; static int seen_
 // arguments first.
 static CmdRec *rec(Cpu *c, NvnCmdBuf *cb, uint32_t op, uint32_t extra) {
     uint32_t size = (uint32_t)((sizeof(CmdRec) + extra + 7) & ~7u);
-    for (int tries = 0; !cb->mem || cb->used + size + JUMP_RESERVE > cb->size; tries++) {
+    bool sh = shadow_on > 0;
+    uint32_t acct = sh ? ACCT(extra) : size, jr = sh ? JUMP_ACCT : (uint32_t)JUMP_RESERVE;  // (the game's view)
+    for (int tries = 0;; tries++) {
+        bool groom = cb->mem && cb->gused + acct + jr <= cb->gsize, hroom = cb->mem && cb->used + size + JUMP_RESERVE <= cb->size;
+        if (sh && groom && !hroom && cb->shadow) host_continue(cb, size), hroom = true;  // (the game's chunk has room)
+        if (groom && hroom) break;
         if (!cb->callback || tries == 2) {
             if (!cb->mem) FATAL("nvn: out of command memory (need %u)\n", size);
             overflow_chunk(cb, size);
@@ -116,13 +261,15 @@ static CmdRec *rec(Cpu *c, NvnCmdBuf *cb, uint32_t op, uint32_t extra) {
         memcpy(saved, c->x, sizeof saved);
         c->x[0] = cb->guest;
         c->x[1] = 0;  // NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY
-        c->x[2] = size + JUMP_RESERVE;
+        c->x[2] = acct + jr;
         c->x[3] = cb->callback_data;
         guest_call(c, cb->callback);
         memcpy(c->x, saved, sizeof saved);
     }
     CmdRec *r = raw_rec(cb->mem + cb->used, op, size);
     cb->used += size;
+    cb->gused += acct;
+    if (cb->shadow) ((Shadow *)cb->shadow)->gend = cb->gmem + cb->gused + jr;  // (what the game knows it gave us)
     return r;
 }
 
@@ -518,7 +665,43 @@ PLAIN(nvnCommandBufferReportCounter, CMD_REPORT_COUNTER)
 NVN(nvnCommandBufferReportValue) { (void)c; static int seen_; if (!seen_++ && ENV("LARECOMP_LOG_NOOP")) LOG("[nvn] no-op called: nvnCommandBufferReportValue\n"); }
 NVN(nvnCommandBufferResetCounter) { (void)c; static int seen_; if (!seen_++ && ENV("LARECOMP_LOG_NOOP")) LOG("[nvn] no-op called: nvnCommandBufferResetCounter\n"); }
 NVN(nvnCommandBufferCallCommands) { record_copy(c, CMD_CALL, 2, (uint32_t)A(1) * 8); }
-NVN(nvnCommandBufferCopyCommands) { record_copy(c, CMD_CALL, 2, (uint32_t)A(1) * 8); }
+// nvnCommandBufferCopyCommands COPIES the lists' commands into this buffer (CallCommands only references them): the
+// game may reset and re-record the source memory as soon as the call returns. Recorded as a CALL, the render thread
+// read the sources a frame or more later - by then rewritten: garbage records (an "impossible draw" with an address
+// as its instance count, a jump to 0x70 - a crash in exec_list after a 2 s shader-compile stall in Floaro, PLA
+// 2026-11-14), the more often the further translation lags behind the game. Now the records are copied here, at
+// once (they are self-contained: arguments and copied data, no pointers into themselves).
+static void copy_list(Cpu *c, NvnCmdBuf *cb, uint64_t handle) {
+    uint64_t p = handle;
+    for (int guard = 0; p && guard < 1000000; guard++) {
+        const CmdRec *s = (const CmdRec *)(uintptr_t)p;
+        if (s->op == CMD_END) return;
+        if (s->op == CMD_JUMP) { p = s->x[0]; continue; }
+        uint32_t size = s->size;
+        if (size < sizeof(CmdRec) || (size & 7) || s->op >= CMD_COUNT) {
+            static int bad;
+            if (bad++ < 5) LOG("[nvn] CopyCommands: a bad record in list %llx (op %u size %u): copy stops there\n",
+                               (unsigned long long)handle, s->op, size);
+            return;
+        }
+        CmdRec *d = rec(c, cb, s->op, size - (uint32_t)sizeof(CmdRec));  // (may call the game's memory callback)
+        memcpy(d, s, size);
+        p += size;
+    }
+}
+NVN(nvnCommandBufferCopyCommands) {
+    NvnCmdBuf *cb = cb_of(A(0));
+    uint64_t n = A(1), h[64], *hs = n <= 64 ? h : malloc(sizeof *hs * n);
+    if (n && A(2)) memcpy(hs, (const void *)(uintptr_t)A(2), sizeof *hs * n);
+    else n = 0;
+    static uint64_t calls, lists;
+    calls++, lists += n;
+    if (calls == 1 || calls == 1000 || calls == 100000)
+        LOG("[nvn] CopyCommands: %llu calls, %llu lists copied (records copied at the call)\n",
+            (unsigned long long)calls, (unsigned long long)lists);
+    for (uint64_t i = 0; i < n; i++) copy_list(c, cb, hs[i]);
+    if (hs != h) free(hs);
+}
 NVN(nvnCommandBufferInsertDebugMarker) { (void)c; static int seen_; if (!seen_++ && ENV("LARECOMP_LOG_NOOP")) LOG("[nvn] no-op called: nvnCommandBufferInsertDebugMarker\n"); }
 NVN(nvnCommandBufferInsertDebugMarkerDynamic) { (void)c; static int seen_; if (!seen_++ && ENV("LARECOMP_LOG_NOOP")) LOG("[nvn] no-op called: nvnCommandBufferInsertDebugMarkerDynamic\n"); }
 NVN(nvnCommandBufferInsertDebugMarkerStatic) { (void)c; static int seen_; if (!seen_++ && ENV("LARECOMP_LOG_NOOP")) LOG("[nvn] no-op called: nvnCommandBufferInsertDebugMarkerStatic\n"); }

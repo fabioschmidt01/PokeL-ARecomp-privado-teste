@@ -137,6 +137,15 @@ static bool overlap_on(void) {
             on = 0;
             LOG("[vk] GPU overlap off on this AMD GPU (#39; F1 > Compatibility or LARECOMP_GPU_OVERLAP=1: on)\n");
             return on;
+        } else if (VK_OVERLAP_DEFAULT && SDL_GetNumLogicalCPUCores() <= 8) {
+            // A CPU with 8 threads or fewer: off by default. Pokémon Legends: Arceus on a Ryzen 3 PRO 4350G (4 cores / 8
+            // threads) + RTX 2060 lost the device in Jubilife's Floaro Main Street (a GPU particle effect; 2026-11-13),
+            // twice; with the overlap off it played on. The game, a frame ahead of the GPU, rewrites data that frame
+            // still reads - a race a fast many-core CPU (24 threads: no crash there) rarely loses. The Steam Deck has 8.
+            on = 0;
+            LOG("[vk] GPU overlap off on this %d-thread CPU (a frame-ahead race lost the device on 8-thread CPUs; F1 > "
+                "Compatibility or LARECOMP_GPU_OVERLAP=1: on)\n", SDL_GetNumLogicalCPUCores());
+            return on;
         } else if (VK_OVERLAP_DEFAULT && !tracked) {
             on = 0;
             LOG("[vk] GPU overlap off: no page write tracking on this system (%s); LARECOMP_GPU_OVERLAP=1 forces it on\n",
@@ -3953,7 +3962,11 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     // pass (first 16 floats, 96 lines), to find other cameras (particles, effects).
     if ((stage == 0 || (stage == 1 && !g_game_is_la)) && r.addr && size >= 64) {
         float fov_scale = 1.0f;
-        if (g_settings.fov >= FOV_MIN && g_settings.fov <= FOV_MAX && g_settings.fov != FOV_DEFAULT) {
+        // (Pokémon Legends: Arceus: the field of view is the camera's own now - runtime/hle/widescreen.c
+        // rt_pla_proj_aspect; LARECOMP_FOV_UBO=1: scaled here as before)
+        static int fov_ubo = -1;
+        if (fov_ubo < 0) fov_ubo = g_game_is_la || (ENV("LARECOMP_FOV_UBO") && atoi(ENV("LARECOMP_FOV_UBO")) != 0);
+        if (fov_ubo && g_settings.fov >= FOV_MIN && g_settings.fov <= FOV_MAX && g_settings.fov != FOV_DEFAULT) {
             fov_scale = tanf(30.0f * (float)M_PI / 180.0f) / tanf(((float)g_settings.fov * 0.5f) * (float)M_PI / 180.0f);
         }
         static int log_cam = -1, cam_slot = -2, cam_generic = -1;
@@ -7142,15 +7155,18 @@ static void draw_(CmdRec *r, bool indexed) {
         float k = widescreen_effect_stretch(g_cur_fs_hash);
         float vx = vp[0] * vp_sx + vp_ox, vw = vp[2] * vp_sx;
         if (k > 1.0f) { vx -= vw * (k - 1) / 2; vw *= k; }
-        float vy = vp[1] * vp_sy + vp_oy;
+        float vy = vp[1] * vp_sy + vp_oy, vh = vp[3] * vp_sy;
+        extern float fov_effect_stretch(uint64_t fs_hash);  // (a wider field of view: camera-attached effects too)
+        float kf = fov_effect_stretch(g_cur_fs_hash);
+        if (kf > 1.0f) { vx -= vw * (kf - 1) / 2; vw *= kf; vy -= vh * (kf - 1) / 2; vh *= kf; }
         fsr2_frame_jitter();
         if ((fsr2_jx != 0 || fsr2_jy != 0) && fsr2_scene_pass())  // (FSR 2: the frame's sub-pixel offset)
-            vx += fsr2_jx * vw / (float)fsr2_scene_w, vy += fsr2_jy * fabsf(vp[3] * vp_sy) / (float)fsr2_scene_h;
-        set_viewport(vx, vy, vw, vp[3] * vp_sy, zn, zf);
+            vx += fsr2_jx * vw / (float)fsr2_scene_w, vy += fsr2_jy * fabsf(vh) / (float)fsr2_scene_h;
+        set_viewport(vx, vy, vw, vh, zn, zf);
         if (g_debug_frame) {
             VkRect2D sr = scissor_rect();
             LOG("[draw]   vp %.2f %.2f %.2f %.2f (stretch %.3f, fs hash %016llx) scissor %d %d %u %u | guest sc %d %d %d %d | pass %ux%u s %.4f %.4f\n",
-                vx, vp[1] * vp_sy + vp_oy, vw, vp[3] * vp_sy, k, (unsigned long long)g_cur_fs_hash, sr.offset.x, sr.offset.y,
+                vx, vy, vw, vh, k > kf ? k : kf, (unsigned long long)g_cur_fs_hash, sr.offset.x, sr.offset.y,
                 sr.extent.width, sr.extent.height, st.scissor[0][0], st.scissor[0][1], st.scissor[0][2], st.scissor[0][3], pass_w, pass_h,
                 vp_sx, vp_sy);
         }
@@ -9312,10 +9328,28 @@ void renderer_save_texture_tex(TexBackend *b, const char *path) {
 }
 
 // ================================================================== executor (renderer.m exec_list)
+// Records one submitted list may run, the lists it calls included (execute_one sets it). A list that reaches itself
+// through a call (stale memory: cmdbuf.c) ran 7-14 million draws a frame, a minute each - a black screen; real frames
+// run a few hundred thousand records at most. LARECOMP_EXEC_BUDGET=<records>.
+static long exec_budget;
 static void exec_list(uint64_t handle, int depth) {
     uint64_t p = handle;
     for (int guard = 0; guard < 10000000; guard++) {
         CmdRec *r = (CmdRec *)(uintptr_t)p;
+        if (__builtin_expect(--exec_budget < 0, 0)) {
+            static int over;
+            if (exec_budget == -1 && over++ < 10)
+                LOG("[exec] a command list ran over its record budget (a list calling itself?): rest of it dropped\n");
+            return;
+        }
+        // (a list rewritten before it was translated - cmdbuf.c nvnCommandBufferCopyCommands - walks into garbage: a
+        // jump to 0x70 crashed here, PLA 2026-11-14. The rest of the list is dropped, the game goes on.)
+        if (__builtin_expect(p < 0x10000 || r->size < sizeof(CmdRec) || (r->size & 7) || r->op >= CMD_COUNT, 0)) {
+            static int bad;
+            if (bad++ < 10) LOG("[exec] a corrupt command list (record at %llx: op %u size %u, depth %d): rest of it dropped\n",
+                                (unsigned long long)p, p < 0x10000 ? 0 : r->op, p < 0x10000 ? 0 : r->size, depth);
+            return;
+        }
         void *x = r->extra;
         if (r->op < CMD_COUNT) op_counts[r->op]++;
         switch (r->op) {
@@ -9624,6 +9658,9 @@ static void execute_one(uint64_t handle, bool submit) {
     plat_sample_focus();
     exec_gen++;
     uint64_t t0 = SDL_GetTicksNS();
+    static long budget;
+    if (!budget) budget = ENV("LARECOMP_EXEC_BUDGET") ? atol(ENV("LARECOMP_EXEC_BUDGET")) : 4000000;
+    exec_budget = budget;
     exec_list(handle, 0);
     uint64_t dt = SDL_GetTicksNS() - t0;
     cum_exec += dt;
