@@ -5,8 +5,8 @@
 1 24 "windows.manifest"
 
 1 VERSIONINFO
-FILEVERSION 0,26,6,0
-PRODUCTVERSION 0,26,6,0
+FILEVERSION 0,26,7,0
+PRODUCTVERSION 0,26,7,0
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS 0x40004L
@@ -18,12 +18,12 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "FileDescription", "PokeL-ARecomp - Pokémon Legends: Arceus PC Port"
-            VALUE "FileVersion", "0.26.6.0"
+            VALUE "FileVersion", "0.26.7.0"
             VALUE "InternalName", "PokeL-ARecomp"
             VALUE "LegalCopyright", "Open source native recompiler for Pokémon Legends: Arceus"
             VALUE "OriginalFilename", "PokeL-ARecomp.exe"
             VALUE "ProductName", "PokeL-ARecomp"
-            VALUE "ProductVersion", "0.26.6.0"
+            VALUE "ProductVersion", "0.26.7.0"
         END
     END
     BLOCK "VarFileInfo"

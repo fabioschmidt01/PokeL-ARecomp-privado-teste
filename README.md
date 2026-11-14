@@ -49,7 +49,8 @@ The game's ARM64 machine code is translated ahead-of-time (AOT) into C and compi
 - **HUD Decoupling**: Isolates 2D UI elements (minimap, health gauges, reticles, text) via `hdr_snapshot` to eliminate ghosting artifacts during Frame Generation.
 - **Explicit VSync Modes**: Choose between *Off (Low Latency / Mailbox)*, *On (VSync / 60 Hz - FIFO)*, or *Off (Unlimited / Immediate)* with instant swapchain recreation.
 - **VSync: Off (Unlimited)**: presents without waiting for the display (lowest latency, may tear), but always capped at the chosen 30 or 60 FPS — running faster made the frame-counting systems (menus, thrown food) faster still.
-- **Internal Resolution Scaling**: From 25% up to 4x native 1080p (4K UHD) with Dynamic Resolution scaling.
+- **Internal Resolution Scaling**: From 25% up to 4x native 1080p (4K UHD) with Dynamic Resolution scaling, plus a **720p (Switch handheld)** option, the default of the *Light* profile, for Steam Deck, integrated GPUs and entry-level cards.
+- **CPU / GPU overlap (automatic)**: the CPU builds the next frame while the GPU draws the current one. It is turned off automatically on CPUs with 8 threads or fewer and on AMD GPUs, where it crashed in the past (override in **F1 > Advanced Video > Compatibility**, or with `LARECOMP_GPU_OVERLAP=1` / `0`).
 - **High Core-Count Scaling (Intel Xeon & Multi-Core CPUs)**: Dynamic worker thread scaling (up to 8 parallel texture deswizzling threads on 16-24+ thread CPUs) eliminating texture streaming stutter.
 - **Dedicated GPU Memory Unlocking (Intel Arc & High-VRAM GPUs)**: Full 3.1 GB physical pool unlocked for GPUs with dedicated VRAM (such as the 12 GB Intel Arc B580 Battlemage), preventing memory thrashing.
 
@@ -64,6 +65,13 @@ The game's ARM64 machine code is translated ahead-of-time (AOT) into C and compi
 - **HDR Display Output**: scRGB / HDR10 support with peak brightness tuning.
 - **HD Texture Pack Loader**: Direct loading from `textures/hd/`.
 - **Ultrawide 21:9 / 32:9 (Hor+) — 🧪 Experimental**: with **F1 > Video > Aspect ratio > Unlocked (ultrawide)** the image fills any window shape: wider screens show more of the world at the sides, with no stretching. The window's shape is detected automatically. *Tested on a real 32:9 monitor in the open world, but battles, cutscenes, interiors and menus are not fully tested yet — bugs may occur* (objects popping in at the screen edges, effects or UI out of place). Please report them in [issue #1](https://github.com/fabioschmidt01/PokeL-ARecomp/issues/1). *Original 16:9* keeps the game's framing with side bars.
+
+- **Field of view slider**: **F1 > Video > Field of view** (45–90) widens the game's own camera. Scenery, particles, torch fire, Pokémon eyes and alert marks and the damage vignette all follow it, and the title screen keeps its framing.
+
+### Stability
+- **Command lists are protected from being overwritten**: the game hands its command memory out again much sooner than this port can translate it. Lists are now kept in the port's own memory until they are translated. This fixed the crashes in Jubilife's Floaro Main Street ([#7](https://github.com/fabioschmidt01/PokeL-ARecomp/issues/7), [#12](https://github.com/fabioschmidt01/PokeL-ARecomp/issues/12)).
+- **Offline network service**: features that try to go online (for example *Connect to the internet* in the menu) are told the Switch is offline instead of crashing the game.
+- **Diagnostic log**: `lasrecomp.log` shows game speed vs real time (`[speed]`, every 10 s) and every setting changed in game (`[settings] changed`), which helps with bug reports.
 
 ### Saves & Safety
 - **Automatic Save Backup Rotation**: Creates timestamped backups in `save/backups/main_YYYYMMDD_HHMMSS.bak` whenever the game commits save data, retaining the 10 most recent copies.

@@ -49,7 +49,8 @@ O código de máquina ARM64 do jogo é traduzido antecipadamente (AOT) para C e 
 - **Desacoplamento de HUD (HUD Decoupling)**: Isola elementos 2D (minimapa, mira de captura, barras de vida, caixas de diálogo) via `hdr_snapshot` para eliminar artefatos e fantasmas visuais com a Geração de Quadros ativada.
 - **Modos Explícitos de VSync**: Selecione entre *Desligado (Baixa Latência / Mailbox)*, *Ligado (VSync / 60 Hz - FIFO)* ou *Desligado (Sem Limite / Immediate)* com recriação dinâmica e imediata da swapchain Vulkan.
 - **VSync: Desligado (Ilimitado)**: apresenta sem esperar a tela (menor latência, pode ter tearing), mas sempre limitado aos 30 ou 60 FPS escolhidos — acima disso, o que o jogo conta por quadro (menus, comida jogada) ficava ainda mais acelerado.
-- **Escala de Resolução Interna**: De 25% até 4x 1080p nativo (4K UHD) com resolução dinâmica.
+- **Escala de Resolução Interna**: De 25% até 4x 1080p nativo (4K UHD) com resolução dinâmica, e a opção **720p (Switch portátil)**, padrão do perfil *Leve*, para Steam Deck, placas integradas e placas de entrada.
+- **Sobreposição CPU / GPU (automática)**: a CPU monta o próximo quadro enquanto a GPU desenha o atual. Ela é desligada automaticamente em CPUs com 8 threads ou menos e em placas AMD, onde já causou travamentos (para mudar: **F1 > Vídeo Avançado > Compatibilidade** ou `LARECOMP_GPU_OVERLAP=1` / `0`).
 - **Escalonamento Multi-Core Agressivo (Intel Xeon e CPUs com Muitos Núcleos)**: Gerenciamento inteligente de threads paralelas de descompactação de texturas (até 8 threads simultâneas em CPUs de 16 a 24+ threads), eliminando engasgos (*stutters*) na exploração de Hisui.
 - **Memória Desbloqueada para GPUs Dedicadas (Intel Arc e GPUs de Alta VRAM)**: Pool físico de 3.1 GB liberado para GPUs com VRAM dedicada (como a **Intel Arc B580 de 12 GB**), evitando o teto de 1 GB das iGPUs.
 
@@ -64,6 +65,13 @@ O código de máquina ARM64 do jogo é traduzido antecipadamente (AOT) para C e 
 - **Suporte a HDR**: Saída scRGB / HDR10 com calibração de brilho máximo.
 - **Suporte a Pacotes de Texturas HD**: Carregamento direto da pasta `textures/hd/`.
 - **Ultrawide 21:9 / 32:9 (Hor+) — 🧪 Experimental**: em **F1 > Vídeo > Proporção > Livre (ultrawide)** a imagem ocupa a janela em qualquer formato: telas mais largas mostram mais do mundo nas laterais, sem esticar. O formato da janela é detectado automaticamente. *Testado num monitor 32:9 real no mundo aberto, mas batalhas, cutscenes, interiores e menus ainda não foram 100% testados — podem ocorrer bugs* (objetos aparecendo/sumindo nas bordas, efeitos ou interface fora do lugar). Por favor, reporte na [issue #1](https://github.com/fabioschmidt01/PokeL-ARecomp/issues/1). *16:9 original* mantém o enquadramento do jogo com barras laterais.
+
+- **Campo de visão (FOV)**: **F1 > Vídeo > Campo de visão** (45–90) amplia a câmera do próprio jogo. Cenário, partículas, fogo das tochas, olhos e alertas dos Pokémon e a vinheta de dano acompanham, e a tela de título mantém o enquadramento.
+
+### Estabilidade
+- **Listas de comandos protegidas contra sobrescrita**: o jogo reaproveita a memória de comandos muito antes de o port terminar de traduzi-la. Agora as listas ficam na memória do próprio port até serem traduzidas. Isso corrigiu os crashes na Floaro Main Street, em Jubilife ([#7](https://github.com/fabioschmidt01/PokeL-ARecomp/issues/7), [#12](https://github.com/fabioschmidt01/PokeL-ARecomp/issues/12)).
+- **Serviço de rede offline**: funções que tentam ficar online (por exemplo *Conectar à internet* no menu) recebem a resposta de que o Switch está sem internet, em vez de derrubar o jogo.
+- **Log de diagnóstico**: o `lasrecomp.log` mostra a velocidade do jogo em relação ao tempo real (`[speed]`, a cada 10 s) e cada configuração alterada no jogo (`[settings] changed`), o que ajuda nos relatórios de bug.
 
 ### Saves e Segurança
 - **Backup Automático Rotacional de Saves**: Gera cópias datadas em `save/backups/main_YYYYMMDD_HHMMSS.bak` a cada salvamento confirmado pelo jogo, retendo as 10 mais recentes contra falhas ou quedas de energia.
